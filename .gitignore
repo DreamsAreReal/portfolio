@@ -1,0 +1,11 @@
+# local-only session transcript — never publish
+transcript.jsonl
+*.jsonl
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+
+# deps / build (none used, but just in case)
+node_modules/
