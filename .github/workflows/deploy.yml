@@ -1,8 +1,126 @@
+# Deploy: a push to main becomes a running version on the VPS.
+#
+# Why this file is self-contained instead of the two-line caller stub the hub
+# documents: the stub calls a reusable workflow that lives in DreamsAreReal/
+# deploy-hub, and that repository is private. A call from THIS repository — a
+# public one — cannot resolve it, so every push since 2026-07-17 failed before a
+# single job started ("This run likely failed because of a workflow file issue",
+# run 35765756617). The tasks repo hit the same wall and solved it the same way
+# (tasks/.github/workflows/deploy.yml, runs 34660309580 / 34660566832).
+#
+# The hub is read, never modified: the SSH block below is its published contract
+# (deploy-hub/bin/runner.sh, the stdin protocol at lines 18-40). This app is
+# registered in template mode (/opt/portfolio-new/app.conf: profile=static,
+# port=9001, health_path=/), so no compose is sent — the runner drives its own
+# template. The shape of a deploy:
+#   build the image here (the 1-CPU VPS never builds) -> push to GHCR ->
+#   one SSH call to the runner, which pulls, restarts and health-gates it.
+# The SSH call's exit status IS the verdict: a failed health gate ends this
+# workflow red and the previous version keeps serving.
+name: deploy
+
 on:
-  push: {branches: [main]}
-permissions: {contents: read, packages: write}
+  push:
+    branches: [main]
+  # A re-deploy of the same commit must be possible without an empty commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# The runner serializes deploys with flock on the VPS and waits up to 5 minutes.
+# Queueing here instead of cancelling keeps a half-finished deploy from dying
+# mid-cutover.
+concurrency:
+  group: deploy-portfolio
+  cancel-in-progress: false
+
+env:
+  APP: portfolio
+  # Where this deploys to lives in repository secrets, not in this file: the
+  # address of a machine is infrastructure, and this repository is public.
+  #   VPS_HOST      - host of the target machine
+  #   VPS_HOST_KEY  - its public SSH host key in `known_hosts` form, pinned so
+  #                   the host is authenticated without StrictHostKeyChecking=no
+  #   VPS_SSH_KEY   - private key of the deploy user
+  VPS_HOST: ${{ secrets.VPS_HOST }}
+  VPS_USER: deploy
+  VPS_HOST_KEY: ${{ secrets.VPS_HOST_KEY }}
+
 jobs:
   deploy:
-    uses: DreamsAreReal/deploy-hub/.github/workflows/deploy.yml@main
-    with: {app: portfolio}
-    secrets: inherit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Record the start of the run
+        id: start
+        # The runner reports the full push->healthy duration on its Telegram
+        # card; it can only know when the push happened if we tell it.
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the image
+        id: image
+        run: |
+          set -euo pipefail
+          # A GHCR path must be lower case, and /opt/portfolio-new/app.conf pins
+          # `image=ghcr.io/dreamsarereal/portfolio` - the runner appends the tag.
+          OWNER="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          IMAGE="ghcr.io/${OWNER}/${APP}"
+          # --platform linux/amd64 is explicit, not decorative: the owner's
+          # machine is arm64 and such an image would not start on this VPS.
+          # --provenance=false keeps the push a plain image manifest instead of
+          # an index with an attestation, which is what the runner's plain
+          # `docker pull` expects.
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            -t "${IMAGE}:sha-${GITHUB_SHA}" \
+            -t "${IMAGE}:latest" \
+            --push .
+
+      - name: Deploy on the VPS
+        env:
+          # The GHCR pull token the runner needs. It reaches the VPS on stdin
+          # and nowhere else: not in argv, not in the SSH command string, not in
+          # this log. It dies with the run.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          ACTOR: ${{ github.actor }}
+          START_EPOCH: ${{ steps.start.outputs.epoch }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          # 600 from the start (install, not printf into a default-umask file),
+          # so the key is never readable by anything else, not even briefly.
+          install -m 600 /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$VPS_HOST_KEY" >> ~/.ssh/known_hosts
+          SUBJECT="$(git log -1 --pretty=%s | tr -d '\r\n' | cut -c1-120)"
+          {
+            printf 'token=%s\n'   "$GH_TOKEN"
+            printf 'actor=%s\n'   "$ACTOR"
+            printf 'subject=%s\n' "$SUBJECT"
+            printf 'start=%s\n'   "$START_EPOCH"
+          } | ssh -i ~/.ssh/deploy_key \
+                -o IdentitiesOnly=yes \
+                -o BatchMode=yes \
+                -o ConnectTimeout=20 \
+                "${VPS_USER}@${VPS_HOST}" "deploy ${APP} sha-${GITHUB_SHA}"
+
+      - name: Remove the deploy key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
